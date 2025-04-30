@@ -96,18 +96,7 @@ async function httpGet(urlPath, params) {
     const fullUrl = `${normalizeUrl(url)}/rest/${urlPath}`;
     try {
         // const response = await axios_1.default.get(fullUrl, {
-        //     params: { ...baseParams, ...params },
-        //     timeout: 20000,
-        //     paramsSerializer: params => qs.stringify(params, { arrayFormat: 'repeat' })
-        // });
-
-        // const response = await axios_1.default.request({
-        //     method: method.toUpperCase(),
-        //     url: fullUrl,
-        //     params: { ...baseParams, ...params },
-        //     headers: method.toUpperCase() === 'POST' ? { "Content-Type": "application/x-www-form-urlencoded" } : undefined,
-        //     // data: method.toUpperCase() === 'POST' ? { ...baseParams, ...params } : undefined,
-        //     // params: method.toUpperCase() === 'GET' ? { ...baseParams, ...params } : undefined,
+        //     params: { ...authParams, ...params },
         //     timeout: 20000,
         //     paramsSerializer: params => qs.stringify(params, { arrayFormat: 'repeat' })
         // });
@@ -116,8 +105,8 @@ async function httpGet(urlPath, params) {
             method: method,
             url: fullUrl,
             timeout: 20000,
+            paramsSerializer: params => qs.stringify(params, { arrayFormat: 'repeat' }),
             headers: { 'User-Agent': getUserAgent() }
-            paramsSerializer: params => qs.stringify(params, { arrayFormat: 'repeat' })
         };
         // 合并基础参数和请求参数
         const mergedParams = { ...authParams, ...params };
@@ -741,7 +730,7 @@ module.exports = {
     platform: "musicfree南瓜音乐",
     version: "2.6.1",
     author: 'v',
-    srcUrl: "https://raw.githubusercontent.com/rceayo/hub/main/misc/nangua.js",
+    srcUrl: "https://raw.githubusercontent.com/rceayo/hub/refs/heads/main/misc/nangua.js",
     cacheControl: "no-cache",
     userVariables: [
         { key: "url", name: "服务器地址 (URL)" },
