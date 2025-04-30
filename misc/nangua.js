@@ -36,18 +36,64 @@ function getUserAgent() {
     }
     return 'MusicFree/Unknown';
 }
-// --- 基础 API ---
-async function httpGet(urlPath, params, method = 'get') {
-    var _a;
-    const userVariables = (_a = env?.getUserVariables()) ?? {};
-    let { url, username, password } = userVariables;
-    if (!(url && username && password)) throw new Error("请在插件设置中填写 Navidrome 服务器地址、用户名和密码");
-    if (!url.startsWith("http://") && !url.startsWith("https://")) url = `http://${url}`;
-    url = url.replace(/\/+$/, "");
+
+
+// --- 统一获取用户变量和认证参数 ---
+function getUserVariables() {
+    return (env?.getUserVariables && env.getUserVariables()) || {};
+}
+function getAuthParams() {
+    const { username, password } = getUserVariables();
     const salt = Math.random().toString(16).slice(2);
     const token = CryptoJs.MD5(`${password}${salt}`).toString(CryptoJs.enc.Hex);
-    const baseParams = { u: username, s: salt, t: token, c: "MusicFree", v: "1.16.1", f: "json" };
-    const fullUrl = `${url}/rest/${urlPath}`;
+    return { u: username, s: salt, t: token, c: "MusicFree", v: "1.16.1", f: "json" };
+}
+
+function deduplicateTracks(tracks) {
+    const seen = new Set();
+    return tracks.filter(track => {
+        if (!track.id) return false;
+        if (seen.has(track.id)) return false;
+        seen.add(track.id);
+        return true;
+    });
+}
+
+// --- Native Token 缓存 ---
+let nativeTokenCache = { token: null, time: 0 };
+async function getNativeToken() {
+    const { url, username, password } = getUserVariables();
+    if (!url || !username || !password) return null;
+    const now = Date.now();
+    // 如果 token 快到期，后台异步刷新
+    if (nativeTokenCache.token && now - nativeTokenCache.time > 3 * 60 * 1000 && now - nativeTokenCache.time < 4 * 60 * 1000) {
+        sendKeepalive(nativeTokenCache.token).catch(() => {});
+    }
+    if (nativeTokenCache.token && now - nativeTokenCache.time < 4 * 60 * 1000) return nativeTokenCache.token;
+    try {
+        const response = await axios_1.default.post(`${normalizeUrl(url)}/auth/login`, { username, password }, {
+            headers: { 'Content-Type': 'application/json', 'User-Agent': getUserAgent() }, timeout: 10000
+        });
+        if (response.data && response.data.token) {
+            nativeTokenCache = { token: response.data.token, time: now };
+            return response.data.token;
+        }
+        return null;
+    } catch { return null; }
+}
+
+// --- 统一URL处理 ---
+function normalizeUrl(url) {
+    if (!url.startsWith("http://") && !url.startsWith("https://")) url = `http://${url}`;
+    return url.replace(/\/+$/, "");
+}
+
+
+// --- 基础 API ---
+async function httpGet(urlPath, params) {
+    const { url } = getUserVariables();
+    const authParams = getAuthParams();
+    const fullUrl = `${normalizeUrl(url)}/rest/${urlPath}`;
     try {
         // const response = await axios_1.default.get(fullUrl, {
         //     params: { ...baseParams, ...params },
@@ -74,7 +120,7 @@ async function httpGet(urlPath, params, method = 'get') {
             paramsSerializer: params => qs.stringify(params, { arrayFormat: 'repeat' })
         };
         // 合并基础参数和请求参数
-        const mergedParams = { ...baseParams, ...params };
+        const mergedParams = { ...authParams, ...params };
         // GET 请求参数放在查询字符串，POST 请求参数放在请求体
         if (method === 'get') {
             config.params = mergedParams;
@@ -101,15 +147,10 @@ async function httpGet(urlPath, params, method = 'get') {
 }
 
 async function httpGetNative(path, params) {
-    var _a;
-    const userVariables = (_a = env?.getUserVariables()) ?? {};
-    let { url } = userVariables;
-    if (!url) throw new Error("请在插件设置中填写 Navidrome 服务器地址");
+    const { url } = getUserVariables();
     const nativeToken = await getNativeToken();
     if (!nativeToken) throw new Error("无法获取 Navidrome Native API Token，请检查用户名和密码");
-    if (!url.startsWith("http://") && !url.startsWith("https://")) url = `http://${url}`;
-    url = url.replace(/\/+$/, "");
-    const fullUrl = `${url}/api/${path}`;
+    const fullUrl = `${normalizeUrl(url)}/api/${path}`;
     try {
         const response = await axios_1.default.get(fullUrl, {
             params: params,
@@ -129,20 +170,10 @@ async function httpGetNative(path, params) {
 
 function generateCoverArtUrl(coverArtId) {
     if (!coverArtId) return null;
-    var _a;
-    const userVariables = (_a = env?.getUserVariables()) ?? {};
-    let { url, username, password } = userVariables;
-    if (!(url && username && password)) return null;
-    if (!url.startsWith("http://") && !url.startsWith("https://")) url = `http://${url}`;
-    url = url.replace(/\/+$/, "");
-    const salt = Math.random().toString(16).slice(2);
-    const token = CryptoJs.MD5(`${password}${salt}`).toString(CryptoJs.enc.Hex);
-    const coverUrl = new URL(`${url}/rest/getCoverArt`);
-    coverUrl.searchParams.append('u', username);
-    coverUrl.searchParams.append('s', salt);
-    coverUrl.searchParams.append('t', token);
-    coverUrl.searchParams.append('c', 'MusicFree');
-    coverUrl.searchParams.append('v', '1.16.1');
+    const { url } = getUserVariables();
+    const authParams = getAuthParams();
+    const coverUrl = new URL(`${normalizeUrl(url)}/rest/getCoverArt`);
+    Object.entries(authParams).forEach(([key, value]) => coverUrl.searchParams.append(key, value));
     coverUrl.searchParams.append('id', String(coverArtId));
     return coverUrl.toString();
 }
@@ -189,7 +220,7 @@ function formatSheetItem(navidromePlaylist, username = "Navidrome 用户") {
 }
 function formatQQImportItem(qqSong) {
     var _a, _b, _c;
-    const albumid = qqSong.albumid || ((_a = qqSong.album) ?? {}).id;
+    // const albumid = qqSong.albumid || ((_a = qqSong.album) ?? {}).id;
     const albummid = qqSong.albummid || ((_b = qqSong.album) ?? {}).mid;
     const albumname = qqSong.albumname || ((_c = qqSong.album) ?? {}).title;
     return {
@@ -200,9 +231,9 @@ function formatQQImportItem(qqSong) {
         album: albumname,
         artwork: albummid ? `https://y.gtimg.cn/music/photo_new/T002R800x800M000${albummid}.jpg` : undefined,
         duration: qqSong.interval,
-        albumid: albumid,
+        // albumid: albumid,
         albummid: albummid,
-        _source: 'qq-import',
+        // _source: 'qq-import',
         _qqId: String(qqSong.id || qqSong.songid)
     };
 }
@@ -216,7 +247,7 @@ function formatNcmMusicItem(ncmSong) {
         album: album?.name || "未知专辑",
         artwork: album?.picUrl,
         duration: ncmSong.dt ? Math.round(ncmSong.dt / 1000) : undefined,
-        _source: 'ncm-import',
+        // _source: 'ncm-import',
         _ncmId: String(ncmSong.id)
     };
 }
@@ -286,61 +317,142 @@ async function getAllSongsApi(page) {
     }
 }
 
-// --- 歌词、音源、封面 ---
+// --- 歌词获取 ---
 async function getLyricApi(musicItem) {
     if (!musicItem || !musicItem.title) return null;
-    const params = { title: musicItem.title };
-    if (musicItem.artist && !['unknown artist', 'various artists'].includes(musicItem.artist.toLowerCase())) params.artist = musicItem.artist;
-    if (musicItem.album && !['unknown album'].includes(musicItem.album.toLowerCase())) params.album = musicItem.album;
     try {
+        const params = { title: musicItem.title };
+        if (musicItem.artist && !['unknown artist', 'various artists'].includes(musicItem.artist.toLowerCase())) params.artist = musicItem.artist;
+        if (musicItem.album && !['unknown album'].includes(musicItem.album.toLowerCase())) params.album = musicItem.album;
         const response = await axios_1.default.get(`${LYRICS_API_BASE_URL}/lyrics`, {
-            params,
-            responseType: 'text',
+            params, responseType: 'text', timeout: 10000, headers: { 'User-Agent': getUserAgent() }
+        });
+        if (response.data && typeof response.data === 'string' && response.data.trim()) {
+            if (!response.data.toLowerCase().includes('not found') && response.data.length > 10)
+                return { rawLrc: he.decode(response.data) };
+        }
+    } catch {}
+    return null;
+}
+
+// --- scrobble 上报函数 ---
+async function scrobbleApi(musicItem, submission = false) {
+    const { url } = getUserVariables();
+    const authParams = getAuthParams();
+    const scrobbleUrl = `${normalizeUrl(url)}/rest/scrobble`;
+    try {
+        await axios_1.default.get(scrobbleUrl, {
+            params: {
+                ...authParams,
+                id: String(musicItem.id),
+                submission: submission ? "true" : "false"
+            },
             timeout: 10000,
             headers: { 'User-Agent': getUserAgent() }
         });
-        if (response.data && typeof response.data === 'string' && response.data.trim()) {
-            if (response.data.toLowerCase().includes('not found') || response.data.length < 10) { /* ignore */ }
-            else return { rawLrc: he.decode(response.data) };
-        }
-    } catch (error) {}
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+// --- 全局变量，记录上一次播放的歌曲 ---
+let lastPlayedMusicItem = null;
+
+// --- 歌曲ID失效时自动搜索替换 ---
+async function tryAutoFixMusicId(musicItem) {
+    // 只处理本地歌单（可根据你的业务逻辑调整判断条件）
+    if (!musicItem || !musicItem.title || !musicItem.artist) return null;
+    // 搜索同名歌曲
+    const { data } = await searchMusic(musicItem.title, 1, 10);
+    // 简单匹配：标题、歌手、专辑、时长等
+    let bestMatch = data.find(item =>
+        item.title === musicItem.title &&
+        item.artist === musicItem.artist &&
+        (!musicItem.album || item.album === musicItem.album) &&
+        (!musicItem.duration || Math.abs(item.duration - musicItem.duration) < 5)
+    );
+    // 没有完全匹配就用第一个
+    if (!bestMatch && data.length > 0) bestMatch = data[0];
+    if (bestMatch) {
+        // 替换ID
+        musicItem.id = bestMatch.id;
+        // 你可以在这里同步更新本地歌单存储（如有持久化）
+        return musicItem;
+    }
     return null;
 }
+// --- 播放流获取函数 ---
 async function getMediaSourceApi(musicItem, quality) {
-    var _a;
-    const userVariables = (_a = env?.getUserVariables()) ?? {};
-    let { url, username, password } = userVariables;
-    if (!(url && username && password)) return null;
-    if (!url.startsWith("http://") && !url.startsWith("https://")) url = `http://${url}`;
-    url = url.replace(/\/+$/, "");
-    const salt = Math.random().toString(16).slice(2);
-    const token = CryptoJs.MD5(`${password}${salt}`).toString(CryptoJs.enc.Hex);
-    const streamUrl = new URL(`${url}/rest/stream`);
-    streamUrl.searchParams.append('u', username);
-    streamUrl.searchParams.append('s', salt);
-    streamUrl.searchParams.append('t', token);
-    streamUrl.searchParams.append('c', 'MusicFree');
-    streamUrl.searchParams.append('v', '1.16.1');
+    const { url } = getUserVariables();
+    const authParams = getAuthParams();
+    const streamUrl = new URL(`${normalizeUrl(url)}/rest/stream`);
+    Object.entries(authParams).forEach(([key, value]) => streamUrl.searchParams.append(key, value));
     streamUrl.searchParams.append('id', String(musicItem.id));
-    return { url: streamUrl.toString() };
+
+    try {
+        const response = await axios_1.default.get(streamUrl.toString(), {
+            responseType: 'arraybuffer',
+            timeout: 15000,
+            validateStatus: () => true,
+            headers: { 'User-Agent': getUserAgent() }
+        });
+        const contentType = response.headers['content-type'] || '';
+        if (contentType.startsWith('audio/')) {
+            // 有效音频流
+            if (lastPlayedMusicItem && lastPlayedMusicItem.id !== musicItem.id) {
+                scrobbleApi(lastPlayedMusicItem, true).catch(() => {});
+            }
+            lastPlayedMusicItem = musicItem;
+            return { url: streamUrl.toString() };
+        } else if (contentType.includes('application/json') || contentType.includes('text/')) {
+            // 可能是错误信息
+            let text = '';
+            try {
+                text = Buffer.from(response.data).toString('utf8');
+                const json = JSON.parse(text);
+                const status = json?.['subsonic-response']?.status;
+                const errorCode = json?.['subsonic-response']?.error?.code;
+                if (status === 'failed' && errorCode === 70) {
+                    // data not found，尝试自动修复
+                    const fixed = await tryAutoFixMusicId(musicItem);
+                    if (fixed) {
+                        await new Promise(r => setTimeout(r, 100));
+                        return await getMediaSourceApi(fixed, quality);
+                    }
+                    return null;
+                }
+            } catch {}
+            return null;
+        }
+        return null;
+    } catch (e) {
+        return null;
+    }
 }
+
 async function getMusicInfoApi(musicItem) {
-    if (musicItem._source === 'navidrome_qq_artwork' || musicItem._source === 'navidrome_ncm_artwork') return { artwork: musicItem.artwork };
-    if (musicItem.artwork && typeof musicItem.artwork === 'string' && (musicItem.artwork.startsWith('http') || musicItem.artwork.startsWith('mf-'))) return { artwork: musicItem.artwork };
-    if (!musicItem || !musicItem.title) return null;
+    if (musicItem._source === 'navidrome_qq_artwork' || musicItem._source === 'navidrome_ncm_artwork') {
+        if (musicItem.artwork) return { artwork: musicItem.artwork };
+    }
+    if (musicItem.artwork && typeof musicItem.artwork === 'string' && (musicItem.artwork.startsWith('http') || musicItem.artwork.startsWith('mf-'))) {
+        return { artwork: musicItem.artwork };
+    }
     try {
         const params = new URLSearchParams();
-        params.append('title', musicItem.title);
+        params.append('title', musicItem.title || '');
         if (musicItem.artist && !['unknown artist', 'various artists'].includes(musicItem.artist.toLowerCase())) params.append('artist', musicItem.artist);
         if (musicItem.album && !['unknown album'].includes(musicItem.album.toLowerCase())) params.append('album', musicItem.album);
         const coverApiUrl = `${LYRICS_API_BASE_URL}/cover?${params.toString()}`;
         return { artwork: coverApiUrl };
-    } catch (e) {
+    } catch {}
+    if (musicItem.id && musicItem._source === 'navidrome') {
         const navidromeCover = generateCoverArtUrl(musicItem.id);
         if (navidromeCover) return { artwork: navidromeCover };
-        return null;
     }
+    return null;
 }
+
 
 // --- 推荐/排行榜 ---
 async function getRecommendSheetTagsApi() {
@@ -348,7 +460,9 @@ async function getRecommendSheetTagsApi() {
 }
 async function getRecommendSheetsByTagApi(tag, page, username) {
     const nativeToken = await getNativeToken();
-    if (nativeToken) await sendKeepalive(nativeToken);
+    if (tag.id === ALL_PLAYLISTS_TAG.id && nativeToken) {
+        sendKeepalive(nativeToken).catch(() => {});
+    }
     if (tag.id === ALL_PLAYLISTS_TAG.id) {
         if (page > 1) return { isEnd: true, data: [] };
         const data = await httpGet('getPlaylists', {});
@@ -362,63 +476,72 @@ async function getRecommendSheetsByTagApi(tag, page, username) {
         return { isEnd: true, data: [] };
     }
 }
+// --- Top榜单功能 ---
 async function getTopListsApi() {
-    const topLists = [
-        { id: 'navidrome_toplist_recent', title: '最近播放' },
+    const lists = [
+        { id: 'navidrome_toplist_starred', title: '我的收藏' },
+        { id: 'navidrome_toplist_random', title: '随机播放' },
+        { id: 'navidrome_toplist_newest', title: '最新添加' },
         { id: 'navidrome_toplist_frequent', title: '播放最多' },
-        { id: 'navidrome_toplist_newest', title: '最新添加' }
+        { id: 'navidrome_toplist_recent', title: '最近播放' }
     ];
-    return [{ title: "Navidrome 排行榜", data: topLists }];
+    return [{ title: "Navidrome 排行榜", data: lists }];
 }
+
 async function getTopListDetailApi(topListItem, page) {
-    let sortField = 'random', sortOrder = 'DESC';
-    switch (topListItem.id) {
-        case 'navidrome_toplist_newest': sortField = 'createdAt'; break;
-        case 'navidrome_toplist_frequent': sortField = 'play_count'; break;
-        case 'navidrome_toplist_recent': sortField = 'play_date'; break;
-    }
-    const start = (page - 1) * pageSize, end = page * pageSize;
     try {
-        const response = await httpGetNative('song', { _sort: sortField, _order: sortOrder, _start: start, _end: end });
-        const songs = response.data ?? [];
-        const totalCountHeader = response.headers?.['x-total-count'];
-        const totalCount = totalCountHeader ? parseInt(totalCountHeader, 10) : (page === 1 && songs.length < pageSize ? songs.length : Infinity);
-        const isEnd = end >= totalCount || songs.length < pageSize;
-        return { isEnd, musicList: songs.map(formatMusicItem) };
+        const start = (page - 1) * pageSize;
+        const end = page * pageSize;
+        if (topListItem.id === 'navidrome_toplist_starred') {
+            if (page > 1) {
+                return { isEnd: true, musicList: [] };
+            }
+            const data = await httpGet('getStarred', {});
+            const songs = data?.['subsonic-response']?.starred?.song ?? [];
+            return { isEnd: true, musicList: songs.map(formatMusicItem) };
+
+        } else if (topListItem.id === 'navidrome_toplist_random') {
+             if (page > 1) {
+                  const data = await httpGet('getRandomSongs', { size: pageSize });
+                  const songs = data?.['subsonic-response']?.randomSongs?.song ?? [];
+                  return { isEnd: true, musicList: songs.map(formatMusicItem) };
+             }
+            const data = await httpGet('getRandomSongs', { size: pageSize });
+            const songs = data?.['subsonic-response']?.randomSongs?.song ?? [];
+            return { isEnd: true, musicList: songs.map(formatMusicItem) };
+
+        } else {
+            let sortField = '';
+            let sortOrder = 'DESC';
+            switch (topListItem.id) {
+                case 'navidrome_toplist_newest': sortField = 'createdAt'; break;
+                case 'navidrome_toplist_frequent': sortField = 'play_count'; break;
+                case 'navidrome_toplist_recent': sortField = 'play_date'; break;
+                default:
+                    return { isEnd: true, musicList: [] };
+            }
+
+            const response = await httpGetNative('song', {
+                _sort: sortField,
+                _order: sortOrder,
+                _start: start,
+                _end: end
+            });
+            const songs = response.data ?? [];
+
+            const isEnd = songs.length < pageSize;
+
+            return { isEnd, musicList: songs.map(formatMusicItem) };
+        }
     } catch (e) {
         return { isEnd: true, musicList: [] };
     }
 }
 
-// --- Native API Token 管理 ---
-async function getNativeToken() {
-    var _a;
-    const userVariables = (_a = env?.getUserVariables()) ?? {};
-    let { url, username, password } = userVariables;
-    if (!url || !username || !password) return null;
-    if (!url.startsWith("http://") && !url.startsWith("https://")) url = `http://${url}`;
-    url = url.replace(/\/+$/, "");
-    const loginUrl = `${url}/auth/login`;
-    try {
-        const response = await axios_1.default.post(loginUrl, { username, password }, {
-            headers: {
-                'Content-Type': 'application/json',
-                'User-Agent': getUserAgent()
-            },
-            timeout: 10000
-        });
-        if (response.data && response.data.token) return response.data.token;
-        else return null;
-    } catch (error) { return null; }
-}
 async function sendKeepalive(nativeToken) {
-    var _a;
-    const userVariables = (_a = env?.getUserVariables()) ?? {};
-    let { url } = userVariables;
+    const { url } = getUserVariables();
     if (!url || !nativeToken) return false;
-    if (!url.startsWith("http://") && !url.startsWith("https://")) url = `http://${url}`;
-    url = url.replace(/\/+$/, "");
-    const keepaliveUrl = `${url}/api/keepalive/keepalive`;
+    const keepaliveUrl = `${normalizeUrl(url)}/api/keepalive/keepalive`;
     try {
         const response = await axios_1.default.get(keepaliveUrl, {
             headers: {
@@ -481,8 +604,8 @@ async function findAndMergeQQTrackOnNavidrome(qqTrack) {
                 duration: bestMatch.duration,
                 suffix: bestMatch.suffix,
                 _source: 'navidrome_qq_artwork',
-                songmid: qqTrack.songmid,
-                _qqId: qqTrack._qqId
+                // songmid: qqTrack.songmid,
+                // _qqId: qqTrack._qqId
             };
         } else return null;
     } catch (e) { return null; }
@@ -616,8 +739,8 @@ async function addSongsToNavidromePlaylistApi(playlistId, songIds) {
 // --- 插件导出对象 ---
 module.exports = {
     platform: "musicfree南瓜音乐",
-    version: "2.4.3",
-    author: 'Ckryin',
+    version: "2.6.1",
+    author: 'v',
     srcUrl: "https://raw.githubusercontent.com/rceayo/hub/main/misc/nangua.js",
     cacheControl: "no-cache",
     userVariables: [
@@ -694,7 +817,9 @@ module.exports = {
     // 支持 QQ/网易云歌单导入
     async importMusicSheet(urlLike) {
         const nativeToken = await getNativeToken();
-        if (nativeToken) await sendKeepalive(nativeToken);
+        if (nativeToken) {
+            sendKeepalive(nativeToken).catch(() => {});
+        }
         // QQ 歌单正则
         const qqRegexList = [
             /https?:\/\/i\.y\.qq\.com\/n2\/m\/share\/details\/taoge\.html\?.*id=([0-9]+)/,
@@ -720,11 +845,11 @@ module.exports = {
                         }
                         const newNavidromePlaylistId = await createNavidromePlaylistApi(qqPlaylistName);
                         if (newNavidromePlaylistId) {
-                            const navidromeSongIdsToAdd = matchedTracks.map(track => track.id);
+                            const navidromeSongIdsToAdd = deduplicateTracks(matchedTracks).map(track => track.id);
                             await addSongsToNavidromePlaylistApi(newNavidromePlaylistId, navidromeSongIdsToAdd);
                         }
                     }
-                    const localPlaylistTracks = matchedTracks.filter(track => track.suffix?.toLowerCase() !== 'm4a');
+                    const localPlaylistTracks = deduplicateTracks(matchedTracks).filter(track => track.suffix?.toLowerCase() !== 'm4a');
                     return localPlaylistTracks;
                 } catch (e) {
                     // 如果是纯数字ID，且QQ导入失败，继续尝试网易云
@@ -757,11 +882,11 @@ module.exports = {
                     }
                     const newNavidromePlaylistId = await createNavidromePlaylistApi(ncmPlaylistName);
                     if (newNavidromePlaylistId) {
-                        const navidromeSongIdsToAdd = matchedTracks.map(track => track.id);
+                        const navidromeSongIdsToAdd = deduplicateTracks(matchedTracks).map(track => track.id);
                         await addSongsToNavidromePlaylistApi(newNavidromePlaylistId, navidromeSongIdsToAdd);
                     }
                 }
-                const localPlaylistTracks = matchedTracks.filter(track => track.suffix?.toLowerCase() !== 'm4a');
+                const localPlaylistTracks = deduplicateTracks(matchedTracks).filter(track => track.suffix?.toLowerCase() !== 'm4a');
                 return localPlaylistTracks;
             } catch (e) { throw new Error(`导入网易云歌单失败: ${e.message}`); }
         }
